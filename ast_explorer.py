@@ -10,7 +10,18 @@ import tty
 from contextlib import contextmanager
 from curses import setupterm, tigetstr, tparm
 from itertools import chain, cycle, islice
-from typing import Dict, Iterable, List, Optional, Tuple, TypeVar
+from typing import (
+    Callable,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    MutableSequence,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+)
 
 import gdb
 
@@ -30,6 +41,8 @@ from box_printer import (
 )
 
 
+K = TypeVar("K")
+V = TypeVar("V")
 T = TypeVar("T")
 
 
@@ -64,16 +77,19 @@ class AstNode:
     def child(self) -> Optional[AstNode]:
         if child := self.value["child"]:
             return AstNode(child)
+        return None
 
     @property
     def data(self) -> Optional[AstNode]:
         if data := self.value["data"]:
             return AstNode(data.cast(gdb.lookup_type("ast_t").pointer()))
+        return None
 
     @property
     def parent(self) -> Optional[AstNode]:
         if parent := self.value["parent"]:
             return AstNode(parent)
+        return None
 
     @property
     def sibling(self) -> Optional[AstNode]:
@@ -82,13 +98,14 @@ class AstNode:
         """
         if sibling := self.value["sibling"]:
             return AstNode(sibling)
+        return None
 
     @property
     def siblings(self) -> Iterable[AstNode]:
         """
         Returns the node itself and all its siblings.
         """
-        current_value = self
+        current_value: Optional[AstNode] = self
         while current_value:
             yield current_value
             current_value = current_value.sibling
@@ -109,6 +126,7 @@ class AstNode:
                     break
                 result[sym["name"].string()] = (int(sym["def"]), int(sym["status"]))
             return result
+        return None
 
     def token_int(self):
         return int(self.value["t"]["integer"]["low"])
@@ -118,6 +136,7 @@ class AstNode:
             string := self.value["t"]["string"]
         ):
             return string.string()
+        return None
 
 
 def _is_ast(type_: gdb.Type) -> bool:
@@ -226,7 +245,8 @@ class PonyAstCommand(gdb.Command):
             )
             highlight = nodes.next()
 
-        nodes = highlight = None
+        nodes: _BackwardForwardCycle[AstNode]
+        highlight = ast
         new_root(ast)
         skip_redraw = False
         max_level = None
@@ -265,7 +285,10 @@ class PonyAstCommand(gdb.Command):
                 )
                 skip_redraw = True
             elif cmd is AstCommand.less_details:
-                max_level = max(1, max_level - 1) if max_level is not None else 1
+                if max_level is None:
+                    max_level = 1
+                else:
+                    max_level = max(1, max_level - 1)
             elif cmd is AstCommand.more_details:
                 max_level = max_level + 1 if max_level else 1
             elif cmd is AstCommand.jump_to_data:
@@ -289,7 +312,7 @@ class PonyAstCommand(gdb.Command):
             else:
                 skip_redraw = True
 
-    def _render_details(self, node: AstNode, max_width: int) -> List[str]:
+    def _render_details(self, node: AstNode, max_width: int) -> str:
         details = Row(
             [self._render_node_details(node), Text("   "), self._render_keymap()]
         )
@@ -298,6 +321,7 @@ class PonyAstCommand(gdb.Command):
     def _render_node_details(self, node: AstNode) -> Box:
         parent_addr = int(node.parent.value) if node.parent else 0
         child_addr = int(node.child.value) if node.child else 0
+        symbols: Box
         if symtab := node.symtab():
             names = [Text(name) for name in symtab]
             if len(names) > 5:
@@ -345,8 +369,8 @@ class PonyAstCommand(gdb.Command):
         keys = []
         descriptions = []
         for (key, cmd) in self.KEYMAP.items():
-            key = key.decode("utf-8").replace("\x1b", "<esc>")
-            keys.append(Text(f"{key:>5}"))
+            key_repr = key.decode("utf-8").replace("\x1b", "<esc>")
+            keys.append(Text(f"{key_repr:>5}"))
             descriptions.append(Text(cmd.value))
         return frame(
             "Keymap", Row([Column(keys), Column([Text(" ")]), Column(descriptions)])
@@ -372,7 +396,7 @@ class PonyAstCommand(gdb.Command):
 ## Misc utility
 
 
-class _BackwardForwardCycle:
+class _BackwardForwardCycle(Generic[T]):
     def __init__(self, iterable: Iterable[T]):
         # Invariant: index points to the last value.
         # Only negative on initialization.
@@ -391,15 +415,28 @@ class _BackwardForwardCycle:
 ## Pony AST pretty printer
 
 
-class AstPrettyPrinter:
-    _renderers = {}
+class _Registry(Generic[K, V]):
+    def __init__(self):
+        self._known = {}
 
-    def renders(token_id, *, _renderers=_renderers):
-        def decorator(f):
-            _renderers[token_id] = f
+    def __call__(self, key: K):
+        def decorator(f: V) -> V:
+            self._known[key] = f
             return f
 
         return decorator
+
+    def __getitem__(self, key: K) -> Optional[V]:
+        return self._known.get(key)
+
+
+class AstPrettyPrinter:
+    # _renderers: Dict[] = {}
+
+    _renderers: _Registry[
+        str, Callable[[AstPrettyPrinter, AstNode, AstNode, Set[AstNode], int], Box]
+    ] = _Registry()
+    renders = _renderers
 
     def __init__(self, max_level: Optional[int], max_width: int):
         self.max_level = max_level or sys.maxsize
@@ -426,10 +463,10 @@ class AstPrettyPrinter:
         else:
             seen.add(node)
 
-        if renderer := self._renderers.get(node.token_id):
+        if renderer := self._renderers[node.token_id]:
             return renderer(self, node, highlight, seen, level)
 
-        doc = []
+        doc: MutableSequence[Box] = []
         if child := node.child:
             doc.append(HSpace(" "))
             doc.append(
@@ -492,12 +529,16 @@ class AstPrettyPrinter:
     def _render_string(
         self, node: AstNode, highlight: AstNode, seen, level: int
     ) -> Box:
-        box = Text(node.token_string())
+        string = node.token_string()
+        assert string is not None
+        box = Text(string)
         return self._highlight(box, node == highlight)
 
     @renders("TK_ID")
     def _render_id(self, node: AstNode, highlight: AstNode, seen, level: int) -> Box:
-        return self._highlight(Text(node.token_string()), highlight == node)
+        id_string = node.token_string()
+        assert id_string is not None
+        return self._highlight(Text(id_string), highlight == node)
 
     @renders("TK_ACTOR")
     @renders("TK_ARROW")
@@ -529,11 +570,13 @@ class AstPrettyPrinter:
     def _render_node_with_children(
         self, node: AstNode, highlight: AstNode, seen, level: int
     ) -> Box:
-        children = list(node.child.siblings)
-        boxes = [HSpace(" ")] * 2 * len(children)
-        boxes[0::2] = [
+        child = node.child
+        assert child is not None
+        children = list(child.siblings)
+        boxes: List[Box] = list(HSpace(" ") for _ in range(2 * len(children)))
+        boxes[0::2] = (
             self._render_node(child, highlight, seen, level + 1) for child in children
-        ]
+        )
         return self._highlight(
             frame(node.token_id[3:].lower(), group(boxes)), node == highlight
         )

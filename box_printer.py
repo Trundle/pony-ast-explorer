@@ -5,7 +5,7 @@ import enum
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import singledispatchmethod
-from typing import Callable, Generator, Iterable, List, Optional, Tuple
+from typing import Generator, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 
 RenderedLine = Tuple[int, str]
@@ -27,9 +27,16 @@ class Alt(Box):
     right: Box
 
 
+class DecoratorCallback(Protocol):
+    def __call__(
+        self, printer: BoxPrinter
+    ) -> Generator[None, RenderedBox, RenderedBox]:
+        pass
+
+
 @dataclass
 class Decorated(Box):
-    decorator: Callable[BoxPrinter, Generator[None, RenderedBox, RenderedBox]]
+    decorator: DecoratorCallback
     box: Box
 
 
@@ -46,7 +53,7 @@ class Column(Box):
     A column of boxes.
     """
 
-    boxes: List[Box]
+    boxes: Sequence[Box]
 
 
 @dataclass
@@ -55,7 +62,7 @@ class Row(Box):
     A row of boxes.
     """
 
-    boxes: List[Box]
+    boxes: Sequence[Box]
 
 
 @dataclass
@@ -115,7 +122,7 @@ class BoxPrinter:
     class _State:
         max_width: int
         direction: Direction
-        boxes: List[List[str]] = dataclasses.field(default_factory=lambda: [[]])
+        boxes: List[RenderedBox] = dataclasses.field(default_factory=lambda: [[]])
 
         @property
         def current_box(self) -> RenderedBox:
@@ -151,6 +158,7 @@ class BoxPrinter:
     @_render_box.register
     def _render_text(self, text: Text):
         with self._new_box():
+            assert text.length is not None
             self._state.boxes[-1] = [(text.length, text.text)]
 
     @_render_box.register
@@ -194,12 +202,12 @@ class BoxPrinter:
     @_render_box.register
     def _render_hspace(self, hspace: HSpace):
         if self._state.direction is Direction.HORIZONTAL:
-            self._render_text(Text(hspace.space))
+            self._render_box(Text(hspace.space))
 
     @_render_box.register
     def _render_vspace(self, vspace: VSpace):
         if self._state.direction is Direction.VERTICAL:
-            self._render_text(Text(vspace.space))
+            self._render_box(Text(vspace.space))
 
     @contextmanager
     def _snapshot(self):
@@ -254,7 +262,7 @@ def max_sum(iterable: Iterable[Tuple[int, int]]) -> Tuple[int, int]:
     return (current_max, current_sum)
 
 
-def group(boxes: List[Box]) -> Box:
+def group(boxes: Sequence[Box]) -> Box:
     return Alt(Row(boxes), Column(boxes))
 
 
