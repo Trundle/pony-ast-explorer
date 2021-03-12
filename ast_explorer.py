@@ -304,8 +304,8 @@ class Lldb(Debugger):
 
     def ast_nodes_in_frame(self) -> Iterable[Tuple[str, AstNode]]:
         for variable in self._context.frame.get_all_variables():
-            if variable.type.name == "ast_t *" and variable.value is not None:
-                yield (variable.name, AstNode(self, variable))
+            if self._is_ast(variable) and variable.value is not None:
+                yield (variable.name, self._to_ast(variable))
 
     def is_null(self, value: lldb.SBValue) -> bool:
         return self.pointer_address(value) == 0  # XXX 0xffffffffffffffff
@@ -334,6 +334,14 @@ class Lldb(Debugger):
     def string_value(self, value: lldb.SBValue) -> str:
         # :/ this seems to be the best - ReadCStringFromMemory didn't always work
         return value.summary[1:-1]
+
+    def _is_ast(self, value: lldb.SBValue) -> bool:
+        return value.type.name.startswith("ast_t *")
+
+    def _to_ast(self, value: lldb.SBValue) -> AstNode:
+        while value.type.name != "ast_t *":
+            value = value.deref
+        return AstNode(self, value)
 
 
 ## pony-ast command
