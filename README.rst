@@ -2,17 +2,23 @@
 Pony AST explorer
 =================
 
-A GDB plugin to interactively explore Pony_ ASTs.
+A GDB and LLDB plugin to interactively explore Pony_ ASTs.
 
 
 Requirements
 ============
 
+One of
+
 * GDB with Python support (Python >= 3.8)
+* LLDB with Python support (Python >= 3.8)
 
 
 How to use
 ==========
+
+GDB
+---
 
 First, load the explorer inside a GDB session::
 
@@ -24,6 +30,18 @@ and, if there are any, ask you which one to explore.
 
 If you use AST explorer regularly, you might want to consider adding the source
 line to your ``.gdbinit``.
+
+
+LLDB
+----
+
+First, load the explorer inside an LLDB session::
+
+   command script import /path/to/checkout/ast_explorer.py
+
+If the script was loaded successfully, there now exists a new interactive
+command ``pony-ast``. Executing it will look for AST nodes in the current scope
+and, if there are any, ask you which one to explore.
 
 
 Features

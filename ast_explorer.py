@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import abc
 import enum
 import fcntl
 import os
@@ -23,7 +24,14 @@ from typing import (
     TypeVar,
 )
 
-import gdb
+try:
+    import gdb
+
+    is_gdb = True
+except ImportError:
+    import lldb
+
+    is_gdb = False
 
 # Wild hack :(
 sys.path.append(os.path.dirname(__file__))
@@ -46,49 +54,104 @@ V = TypeVar("V")
 T = TypeVar("T")
 
 
-## Gdb helpers
+## Debugger abstractions
+
+
+class Debugger(abc.ABC, Generic[T]):
+    @abc.abstractmethod
+    def is_null(self, value: T) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def member(self, value: T, name: str) -> T:
+        ...
+
+    @abc.abstractmethod
+    def pointer_address(self, value: T) -> int:
+        ...
+
+    @abc.abstractmethod
+    def enum_description(self, value: T) -> str:
+        ...
+
+    @abc.abstractmethod
+    def evaluate_expression(self, expr: str) -> T:
+        ...
+
+    @abc.abstractmethod
+    def int_value(self, value: T) -> int:
+        ...
+
+    @abc.abstractmethod
+    def string_value(self, value: T) -> str:
+        ...
+
+    @abc.abstractmethod
+    def pointer_to_ast(self, address: int) -> T:
+        ...
+
+    @abc.abstractmethod
+    def ast_nodes_in_frame(self) -> Iterable[Tuple[str, AstNode]]:
+        """
+        Find all AST nodes in the currently selected frame.
+        """
 
 
 class AstNode:
     """
-    Wrapper around `gdb.Value` to make working with AST nodes a bit more
-    convenient.
+    Wrapper around a debugger value to make working with AST nodes a bit more
+    convenient and debugger-independant.
     """
 
-    def __init__(self, value: gdb.Value):
+    def __init__(self, debugger: Debugger, value: gdb.Value):
+        self._debugger = debugger
         self.value = value
 
     def __eq__(self, other):
         if isinstance(other, AstNode):
-            return int(self.value) == int(other.value)
+            addr = self._debugger.pointer_address(self.value)
+            other_addr = self._debugger.pointer_address(other.value)
+            return addr == other_addr
         return NotImplemented
 
     def __hash__(self):
-        return int(self.value)
+        return self._debugger.pointer_address(self.value)
 
     def __repr__(self):
-        return f"<AstNode@{int(self.value):x}(id={self.token_id})>"
+        addr = self._debugger.pointer_address(self.value)
+        return f"<AstNode@0x{addr:x}(id={self.token_id})>"
+
+    @property
+    def address(self) -> int:
+        return self._debugger.pointer_address(self.value)
+
+    @property
+    def data_address(self) -> int:
+        return self._debugger.pointer_address(self._debugger.member(self.value, "data"))
 
     @property
     def token_id(self) -> str:
-        return str(self.value["t"]["id"])
+        m = self._debugger.member
+        return self._debugger.enum_description(m(m(self.value, "t"), "id"))
 
     @property
     def child(self) -> Optional[AstNode]:
-        if child := self.value["child"]:
-            return AstNode(child)
+        child = self._debugger.member(self.value, "child")
+        if not self._debugger.is_null(child):
+            return AstNode(self._debugger, child)
         return None
 
     @property
     def data(self) -> Optional[AstNode]:
-        if data := self.value["data"]:
-            return AstNode(data.cast(gdb.lookup_type("ast_t").pointer()))
+        data = self._debugger.member(self.value, "data")
+        if not self._debugger.is_null(data):
+            return AstNode(self._debugger, self._debugger.pointer_to_ast(data))
         return None
 
     @property
     def parent(self) -> Optional[AstNode]:
-        if parent := self.value["parent"]:
-            return AstNode(parent)
+        if parent := self._debugger.member(self.value, "parent"):
+            return AstNode(self._debugger, parent)
         return None
 
     @property
@@ -96,8 +159,9 @@ class AstNode:
         """
         The node's direct sibling (if there is one).
         """
-        if sibling := self.value["sibling"]:
-            return AstNode(sibling)
+        sibling = self._debugger.member(self.value, "sibling")
+        if not self._debugger.is_null(sibling):
+            return AstNode(self._debugger, sibling)
         return None
 
     @property
@@ -110,33 +174,53 @@ class AstNode:
             yield current_value
             current_value = current_value.sibling
 
-    def symtab(self) -> Optional[Dict[str, Tuple[int, int]]]:
-        if symtab := self.value["symtab"]:
-            i_ptr = gdb.parse_and_eval("(void *)malloc(sizeof(size_t))")
-            gdb.selected_inferior().write_memory(
-                int(i_ptr), b"\xff" * gdb.lookup_type("size_t").sizeof
-            )
-            result = {}
-            while True:
-                sym = gdb.parse_and_eval(
-                    f"symtab_next(((ast_ptr_t){int(symtab)}), "
-                    f"(size_t *){int(i_ptr)})"
-                )
-                if not sym:
-                    break
-                result[sym["name"].string()] = (int(sym["def"]), int(sym["status"]))
-            return result
+    def symtab(self) -> Optional[Dict[str, Tuple[int, str]]]:
+        symtab = self._debugger.member(self.value, "symtab")
+        if not self._debugger.is_null(symtab):
+            return self._read_symtab(symtab)
         return None
 
     def token_int(self):
-        return int(self.value["t"]["integer"]["low"])
+        m = self._debugger.member
+        return self._debugger.int_value(m(m(m(self.value, "t"), "integer"), "low"))
 
     def token_string(self) -> Optional[str]:
+        m = self._debugger.member
         if self.token_id in {"TK_ID", "TK_STRING"} and (
-            string := self.value["t"]["string"]
+            string := m(m(self.value, "t"), "string")
         ):
-            return string.string()
+            return self._debugger.string_value(string)
         return None
+
+    def dump(self, width: int, verbose: bool = False):
+        ast_node = f"(ast_t *){self._debugger.pointer_address(self.value)}UL"
+        if verbose:
+            expr = f"ast_printverbose({ast_node})"
+        else:
+            expr = f"ast_print({ast_node}, {width})"
+        self._debugger.evaluate_expression(expr)
+
+    def _read_symtab(self, value) -> Dict[str, Tuple[int, str]]:
+        debugger = self._debugger
+        i = debugger.evaluate_expression("(void *)malloc(sizeof(size_t))")
+        i_addr = debugger.pointer_address(i)
+        symtab_addr = debugger.pointer_address(value)
+        debugger.evaluate_expression(f"*((size_t *){i_addr}UL) = (size_t)-1")
+        result = {}
+        while True:
+            sym = debugger.evaluate_expression(
+                f"symtab_next(((symtab_t *){symtab_addr}UL), (size_t *){i_addr}UL)"
+            )
+            if debugger.is_null(sym):
+                break
+            name = debugger.string_value(debugger.member(sym, "name"))
+            def_ = debugger.pointer_address(debugger.member(sym, "def"))
+            status = debugger.enum_description(debugger.member(sym, "status"))
+            result[name] = (def_, status)
+        return result
+
+
+## GDB debugger implementation
 
 
 def _is_ast(type_: gdb.Type) -> bool:
@@ -159,20 +243,45 @@ def _to_ast_ptr(value: gdb.Value) -> gdb.Value:
     raise ValueError
 
 
-def _all_asts_in_selected_frame() -> Iterable[Tuple[gdb.Symbol, AstNode]]:
-    frame = gdb.selected_frame()
-    try:
-        block = frame.block()
-    except RuntimeError:
-        return
-    while block and not (block.is_global or block.is_static):
-        for symbol in block:
-            if symbol.is_variable or symbol.is_argument:
-                if _is_ast(symbol.type):
-                    ast_ptr = _to_ast_ptr(symbol.value(frame))
-                    if not ast_ptr.is_optimized_out:
-                        yield (symbol, AstNode(ast_ptr))
-        block = block.superblock
+class Gdb(Debugger):
+    def is_null(self, value: gdb.Value) -> bool:
+        return int(value) == 0
+
+    def pointer_address(self, pointer: gdb.Value) -> int:
+        return int(pointer)
+
+    def pointer_to_ast(self, pointer: gdb.Value) -> gdb.Value:
+        return pointer.cast(gdb.lookup_type("ast_t").pointer())
+
+    def ast_nodes_in_frame(self) -> Iterable[Tuple[str, AstNode]]:
+        frame = gdb.selected_frame()
+        try:
+            block = frame.block()
+        except RuntimeError:
+            return
+        while block and not (block.is_global or block.is_static):
+            for symbol in block:
+                if symbol.is_variable or symbol.is_argument:
+                    if _is_ast(symbol.type):
+                        ast_ptr = _to_ast_ptr(symbol.value(frame))
+                        if not ast_ptr.is_optimized_out:
+                            yield (str(symbol), AstNode(self, ast_ptr))
+                            block = block.superblock
+
+    def enum_description(self, value: gdb.Value) -> str:
+        return str(value)
+
+    def evaluate_expression(self, expr: str) -> gdb.Value:
+        return gdb.parse_and_eval(expr)
+
+    def member(self, value: gdb.Value, name: str) -> gdb.Value:
+        return value[name]
+
+    def int_value(self, value: gdb.Value) -> int:
+        return int(value)
+
+    def string_value(self, value: gdb.Value) -> str:
+        return value.string()
 
 
 @contextmanager
@@ -186,7 +295,48 @@ def _real_stdout():
         sys.stdout = stdout
 
 
-## Gdb commands
+## LLDB implementation
+
+
+class Lldb(Debugger):
+    def __init__(self, execution_context: lldb.SBExecutionContext):
+        self._context = execution_context
+
+    def ast_nodes_in_frame(self) -> Iterable[Tuple[str, AstNode]]:
+        for variable in self._context.frame.get_all_variables():
+            if variable.type.name == "ast_t *" and variable.value is not None:
+                yield (variable.name, AstNode(self, variable))
+
+    def is_null(self, value: lldb.SBValue) -> bool:
+        return self.pointer_address(value) == 0  # XXX 0xffffffffffffffff
+
+    def pointer_address(self, value: lldb.SBValue) -> int:
+        assert value.type.IsPointerType()
+        return value.unsigned
+
+    def pointer_to_ast(self, pointer: lldb.SBValue) -> lldb.SBValue:
+        assert pointer.type.IsPointerType()
+        addr = self.pointer_address(pointer)
+        return self._context.frame.EvaluateExpression(f"(ast_t *){addr}UL")
+
+    def member(self, value: lldb.SBValue, name: str) -> lldb.SBValue:
+        return value.GetChildMemberWithName(name)
+
+    def enum_description(self, value: lldb.SBValue) -> str:
+        return value.value
+
+    def evaluate_expression(self, expr: str) -> lldb.SValue:
+        return self._context.frame.EvaluateExpression(expr)
+
+    def int_value(self, value: lldb.SBValue) -> int:
+        return value.value
+
+    def string_value(self, value: lldb.SBValue) -> str:
+        # :/ this seems to be the best - ReadCStringFromMemory didn't always work
+        return value.summary[1:-1]
+
+
+## pony-ast command
 
 
 class AstCommand(enum.Enum):
@@ -203,7 +353,7 @@ class AstCommand(enum.Enum):
     zoom_in = "zoom into selected node"
 
 
-class PonyAstCommand(gdb.Command):
+class PonyAstCommand:
     KEYMAP = {
         b"q": AstCommand.exit,
         b"\x1b": AstCommand.exit,
@@ -219,14 +369,10 @@ class PonyAstCommand(gdb.Command):
         b"v": AstCommand.print_verbose,
     }
 
-    def __init__(self):
-        super().__init__("pony-ast", gdb.COMMAND_USER)
+    def __init__(self, debugger: Debugger):
+        self._gdb = debugger
 
-    def invoke(self, arg, from_tty):
-        if not from_tty:
-            print("[ERROR] no tty :( :(", file=sys.stderr)
-            return
-        self.dont_repeat()
+    def __call__(self):
         stdout = sys.__stdout__
         with _restore_term(stdout), _alternate_screen(stdout), _real_stdout():
             _disable_echo(stdout)
@@ -274,15 +420,11 @@ class PonyAstCommand(gdb.Command):
                 highlight = nodes.next()
             elif cmd is AstCommand.print_ast:
                 print()
-                gdb.parse_and_eval(
-                    f"ast_print((ast_ptr_t)0x{int(highlight.value):x}, {width})"
-                )
+                highlight.dump(width, verbose=False)
                 skip_redraw = True
             elif cmd is AstCommand.print_verbose:
                 print()
-                gdb.parse_and_eval(
-                    f"ast_printverbose((ast_ptr_t)0x{int(highlight.value):x})"
-                )
+                highlight.dump(width, verbose=True)
                 skip_redraw = True
             elif cmd is AstCommand.less_details:
                 if max_level is None:
@@ -319,8 +461,8 @@ class PonyAstCommand(gdb.Command):
         return BoxPrinter(details, max_width).render()
 
     def _render_node_details(self, node: AstNode) -> Box:
-        parent_addr = int(node.parent.value) if node.parent else 0
-        child_addr = int(node.child.value) if node.child else 0
+        parent_addr = node.parent.address if node.parent else 0
+        child_addr = node.child.address if node.child else 0
         symbols: Box
         if symtab := node.symtab():
             names = [Text(name) for name in symtab]
@@ -328,7 +470,7 @@ class PonyAstCommand(gdb.Command):
                 names[5:] = [Text("…")]
             values = Column(
                 [
-                    Text(f"0x{addr:x},{status:x}")
+                    Text(f"0x{addr:x},{status}")
                     for (addr, status) in islice(symtab.values(), 5)
                 ]
             )
@@ -353,10 +495,10 @@ class PonyAstCommand(gdb.Command):
                 Column(
                     [
                         Text(node.token_id),
-                        Text(f"0x{int(node.value):x}"),
-                        Text(f"0x{int(parent_addr):x}"),
-                        Text(f"0x{int(child_addr):x}"),
-                        Text(f"0x{int(node.value['data']):x}"),
+                        Text(f"0x{node.address:x}"),
+                        Text(f"0x{parent_addr:x}"),
+                        Text(f"0x{child_addr:x}"),
+                        Text(f"0x{node.data_address:x}"),
                         Text(string if string is not None else ""),
                         symbols,
                     ]
@@ -377,7 +519,7 @@ class PonyAstCommand(gdb.Command):
         )
 
     def _select_ast_var(self):
-        ast_vars = list(_all_asts_in_selected_frame())
+        ast_vars = list(self._gdb.ast_nodes_in_frame())
         if not ast_vars:
             return
         print("Select AST:")
@@ -391,6 +533,38 @@ class PonyAstCommand(gdb.Command):
                     return ast_vars[i - 1][1]
             elif key == b"\x1b":
                 return
+
+
+## Gdb implementation of PonyAstCommand
+
+
+if is_gdb:
+
+    class GdbPonyAstCommand(PonyAstCommand, gdb.Command):
+        def __init__(self):
+            gdb.Command.__init__(self, "pony-ast", gdb.COMMAND_USER)
+            PonyAstCommand.__init__(self, Gdb())
+
+        def invoke(self, arg, from_tty):
+            if not from_tty:
+                print("[ERROR] no tty :( :(", file=sys.stderr)
+                return
+            self.dont_repeat()
+            self()
+
+
+## LLDB implementaiton of PonyAstCommand
+
+if not is_gdb:
+
+    class LldbPonyAstCommand(PonyAstCommand):
+        def __init__(self, debugger: Lldb):
+            super().__init__(debugger)
+
+    def _lldb_cmd_pony_ast(debugger, command, exe_ctx, result, internal_dict):
+        lldb = Lldb(exe_ctx)
+        cmd = LldbPonyAstCommand(lldb)
+        cmd()
 
 
 ## Misc utility
@@ -664,7 +838,12 @@ def _term_size(fd):
 
 
 def _init():
-    PonyAstCommand()
+    if is_gdb:
+        GdbPonyAstCommand()
+    else:
+        lldb.debugger.HandleCommand(
+            "command script add -f ast_explorer._lldb_cmd_pony_ast pony-ast"
+        )
     setupterm(None, sys.__stdout__.fileno())
 
 
