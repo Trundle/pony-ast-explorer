@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import abc
 import enum
-import fcntl
 import os
-import struct
 import sys
 import termios
 import tty
@@ -385,7 +383,7 @@ class PonyAstCommand:
         with _restore_term(stdout), _alternate_screen(stdout), _real_stdout():
             _disable_echo(stdout)
             _cbreak(stdout)
-            (height, width) = _term_size(stdout)
+            (width, height) = os.get_terminal_size(stdout.fileno())
 
             if ast := self._select_ast_var():
                 self._view_loop(ast, height, width)
@@ -839,10 +837,6 @@ def _next_key():
 
 def _reset_colors():
     return tigetstr("op")
-
-
-def _term_size(fd):
-    return struct.unpack("hhhh", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))[0:2]
 
 
 def _init():
