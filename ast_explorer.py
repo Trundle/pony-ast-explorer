@@ -20,6 +20,7 @@ from typing import (
     Set,
     Tuple,
     TypeVar,
+    Union,
 )
 
 try:
@@ -85,7 +86,7 @@ class Debugger(abc.ABC, Generic[T]):
         ...
 
     @abc.abstractmethod
-    def pointer_to_ast(self, address: int) -> T:
+    def pointer_to_ast(self, value: T) -> T:
         ...
 
     @abc.abstractmethod
@@ -101,7 +102,7 @@ class AstNode:
     convenient and debugger-independant.
     """
 
-    def __init__(self, debugger: Debugger, value: gdb.Value):
+    def __init__(self, debugger: Debugger, value: Union[gdb.Value, lldb.SBValue]):
         self._debugger = debugger
         self.value = value
 
@@ -254,17 +255,18 @@ class Gdb(Debugger):
     def ast_nodes_in_frame(self) -> Iterable[Tuple[str, AstNode]]:
         frame = gdb.selected_frame()
         try:
-            block = frame.block()
+            block: Optional[gdb.Block] = frame.block()
         except RuntimeError:
             return
-        while block and not (block.is_global or block.is_static):
+        while block is not None and not (block.is_global or block.is_static):
             for symbol in block:
                 if symbol.is_variable or symbol.is_argument:
+                    assert symbol.type is not None
                     if _is_ast(symbol.type):
                         ast_ptr = _to_ast_ptr(symbol.value(frame))
                         if not ast_ptr.is_optimized_out:
                             yield (str(symbol), AstNode(self, ast_ptr))
-                            block = block.superblock
+            block = block.superblock
 
     def enum_description(self, value: gdb.Value) -> str:
         return str(value)
@@ -323,11 +325,11 @@ class Lldb(Debugger):
     def enum_description(self, value: lldb.SBValue) -> str:
         return value.value
 
-    def evaluate_expression(self, expr: str) -> lldb.SValue:
+    def evaluate_expression(self, expr: str) -> lldb.SBValue:
         return self._context.frame.EvaluateExpression(expr)
 
     def int_value(self, value: lldb.SBValue) -> int:
-        return value.value
+        return value.signed
 
     def string_value(self, value: lldb.SBValue) -> str:
         # :/ this seems to be the best - ReadCStringFromMemory didn't always work
