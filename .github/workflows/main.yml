@@ -1,0 +1,24 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  typecheck:
+    name: Check types with mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+      - name: Install mypy
+        run: pip install mypy
+      - run: mypy .
+
+  lint:
+    name: Check code formatting with black
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+      - name: Install black
+        run: pip install black
+      - run: black --check --diff .
